@@ -59,6 +59,7 @@ layout (constant_id = 10) const uint MAT_ACC_COUNT = 1;
 layout (constant_id = 11) const uint EXT_FLAG = 0;
 layout (constant_id = 12) const uint WARPSIZE = 16;
 layout (constant_id = 13) const uint TM = 8;
+layout (constant_id = 14) const uint GQA_HEAD_FOLDER = 1;
 
 #define SUBGROUP_COUNT (GROUPSIZE / WARPSIZE)
 #define UNALIGNED_MASK_DIM (1 << 0x0)
@@ -66,6 +67,7 @@ layout (constant_id = 13) const uint TM = 8;
 #define MAT_P_COUNT (DP / TM)
 #define MAT_O_COUNT (OUTPUT_DIM_PER_WARP / TM)
 #define QK_SUBGROUPS (OUTPUT_PER_WORK_GROUP / TN)
+#define OUTPUT_LENGTH_PER_WG (OUTPUT_PER_WORK_GROUP / GQA_HEAD_FOLDER)
 #define V_LOAD_SUBGROUPS (QK_SUBGROUPS == SUBGROUP_COUNT ? SUBGROUP_COUNT : SUBGROUP_COUNT - QK_SUBGROUPS)
 #define K_PER_LANE (HEAD_DIM_QK % 64 == 0 ? 8 : 4)
 #define LOAD_K_PER_LOOP (GROUPSIZE * K_PER_LANE)
@@ -75,7 +77,7 @@ layout (constant_id = 13) const uint TM = 8;
 #define LOAD_V_HORIZONTAL_GROUPS (V_LOAD_SUBGROUPS / LOAD_V_VERTICAL_GROUPS)
 #define LOAD_V_LOOPS ((HEAD_DIM_PV / TM + LOAD_V_HORIZONTAL_GROUPS - 1) / LOAD_V_HORIZONTAL_GROUPS)
 #define LOAD_V_BOUNDARY_CHECK HEAD_DIM_PV % (LOAD_V_HORIZONTAL_GROUPS * TM) != 0
-#define LOAD_M_VERTICAL_GROUPS (OUTPUT_PER_WORK_GROUP / WARPSIZE)
+#define LOAD_M_VERTICAL_GROUPS (OUTPUT_LENGTH_PER_WG / WARPSIZE)
 #define LOAD_M_HORIZONTAL_GROUPS (SUBGROUP_COUNT / LOAD_M_VERTICAL_GROUPS)
 #define LOAD_M_LOOPS ((DP + LOAD_M_HORIZONTAL_GROUPS - 1) / LOAD_M_HORIZONTAL_GROUPS)
 
@@ -86,7 +88,7 @@ layout (constant_id = 13) const uint TM = 8;
 #define SLM_POOL_SIZE_Q (OUTPUT_PER_WORK_GROUP * Q_MAT_IN_SLM)
 #define SLM_POOL_SIZE_K (LOAD_K_LOOPS * LOAD_K_PER_LOOP)
 #define SLM_POOL_SIZE_V (DP * HEAD_DIM_PV)
-#define SLM_POOL_SIZE_M (OUTPUT_PER_WORK_GROUP * DP)
+#define SLM_POOL_SIZE_M (OUTPUT_LENGTH_PER_WG * DP)
 #define SLM_POOL_SIZE_COMPENSATION (OUTPUT_PER_WORK_GROUP)
 #define SLM_POOL_SIZE_ACC (MAT_ACC_COUNT * TM * TN * SUBGROUP_COUNT)
 
@@ -98,7 +100,7 @@ layout (constant_id = 13) const uint TM = 8;
 #define SLM_OFFSET_BASE_ACC (SLM_OFFSET_BASE_K / 2)
 #define SLM_OFFSET_BASE_M (SLM_OFFSET_BASE_K + SLM_POOL_SIZE_K)
 
-#define MASK_IN_SLM (OUTPUT_PER_WORK_GROUP < GROUPSIZE)
+#define MASK_IN_SLM (OUTPUT_LENGTH_PER_WG < GROUPSIZE)
 
 #define OUTPUT_VERTICAL_GROUPS QK_SUBGROUPS
 #define OUTPUT_HORIZONTAL_GROUPS (HEAD_DIM_PV / OUTPUT_DIM_PER_WARP)
@@ -131,7 +133,7 @@ void main() {
   const uint laneLoMatToScalar = lane % TN;
   const uint laneHiMatToScalar = lane / TN;
   const uint headIdx = gl_WorkGroupID.x;
-  const uint kvHeadIdx = headIdx / GQA_RATIO;
+  const uint kvHeadIdx = headIdx * GQA_HEAD_FOLDER / GQA_RATIO;
   const uint outIdx = gl_WorkGroupID.y;
   const uint batchIdx =  gl_WorkGroupID.z;
   const uint localLinearId = gl_SubgroupID;
@@ -147,6 +149,8 @@ void main() {
   const uint vvm = localLinearId / LOAD_M_HORIZONTAL_GROUPS;
   const uint hho = localLinearId / QK_SUBGROUPS;
   const uint vvo = localLinearId % QK_SUBGROUPS;
+  const uint hhoFold = vvo % GQA_HEAD_FOLDER;
+  const uint vvoFold = vvo / GQA_HEAD_FOLDER;
   const uint qDim = p.qHead * HEAD_DIM_QK;
   const uint oDim = p.qHead * HEAD_DIM_PV;
   const uint kDim = p.kStrideTok;
@@ -156,7 +160,7 @@ void main() {
   uint offsetBaseV = batchIdx * p.batchStrideV + kvHeadIdx * p.vStrideHead + hhv * TM + vvv * vDim * TK;
   uint offsetBaseMask;
   if (MASK_IN_SLM) {
-    offsetBaseMask = (outIdx * OUTPUT_PER_WORK_GROUP + vvm * WARPSIZE + lane);
+    offsetBaseMask = (outIdx * OUTPUT_LENGTH_PER_WG + vvm * WARPSIZE + lane);
     offsetBaseMask = min(offsetBaseMask, p.activationLength - 1);
     offsetBaseMask = offsetBaseMask * maskDim + batchIdx * p.batchStrideM;
     if ((EXT_FLAG & UNALIGNED_MASK_DIM) != 0) {
@@ -169,7 +173,7 @@ void main() {
       offsetBaseMask = offsetBaseMask + hhm;
     }
   } else {
-    offsetBaseMask = (outIdx * OUTPUT_PER_WORK_GROUP + vvm * TN + laneLoMatToScalar);
+    offsetBaseMask = (outIdx * OUTPUT_LENGTH_PER_WG + vvm * TN + laneLoMatToScalar);
     offsetBaseMask = min(offsetBaseMask, p.activationLength - 1);
     offsetBaseMask = offsetBaseMask * maskDim + batchIdx * p.batchStrideM + laneHiMatToScalar * SOFTMAX_LOOP_COUNT;
     if ((EXT_FLAG & UNALIGNED_MASK_DIM) == 0) {
@@ -179,14 +183,14 @@ void main() {
   const uint offsetSlmV = (vvv * TK * HEAD_DIM_PV + hhv * TM * TK + SLM_OFFSET_BASE_V);
   const uint offsetSlmM = ((vvm * WARPSIZE + lane) * DP + SLM_OFFSET_BASE_M);
   const uint offsetStoreFp16SlmP = (SLM_OFFSET_BASE_P + localLinearId * TN * DP + laneLoMatToScalar * DP) + laneHiMatToScalar * SOFTMAX_LOOP_COUNT;
-  const uint offsetSlmLoadMaskP = (localLinearId * TN * DP + laneLoMatToScalar * DP + laneHiMatToScalar * SOFTMAX_LOOP_COUNT + SLM_OFFSET_BASE_M);
-  uint offsetOut = (batchIdx * p.batchStrideO + outIdx * OUTPUT_PER_WORK_GROUP * oDim + headIdx * HEAD_DIM_PV + vvo * TN * oDim + hho * OUTPUT_DIM_PER_WARP + laneLoMatToScalar * oDim) / 4 + laneHiMatToScalar;
-  uint offsetBaseQ = outIdx * OUTPUT_PER_WORK_GROUP + vvo * TN + laneLoMatToScalar;
+  const uint offsetSlmLoadMaskP = (vvoFold * TN * DP + laneLoMatToScalar * DP + laneHiMatToScalar * SOFTMAX_LOOP_COUNT + SLM_OFFSET_BASE_M);
+  uint offsetOut = (batchIdx * p.batchStrideO + outIdx * OUTPUT_LENGTH_PER_WG * oDim + (headIdx * GQA_HEAD_FOLDER + hhoFold) * HEAD_DIM_PV + vvoFold * TN * oDim + hho * OUTPUT_DIM_PER_WARP + laneLoMatToScalar * oDim) / 4 + laneHiMatToScalar;
+  uint offsetBaseQ = outIdx * OUTPUT_LENGTH_PER_WG + vvoFold * TN + laneLoMatToScalar;
   offsetBaseQ = min(offsetBaseQ, p.activationLength - 1);
-  offsetBaseQ = (offsetBaseQ * qDim + batchIdx * p.batchStrideQ + headIdx * HEAD_DIM_QK) / 8 + laneHiMatToScalar;
+  offsetBaseQ = (offsetBaseQ * qDim + batchIdx * p.batchStrideQ + (headIdx * GQA_HEAD_FOLDER + hhoFold) * HEAD_DIM_QK) / 8 + laneHiMatToScalar;
   const float fp32Min = uintBitsToFloat(0xFEFFFFFF);
   const float16_t fp16Min = float16_t(fp32Min);
-  const float fp32SinkCoeff = sinkCoeff[headIdx];
+  const float fp32SinkCoeff = sinkCoeff[headIdx * GQA_HEAD_FOLDER + hhoFold];
   coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> matQ[MAT_Q_COUNT];
   uint offsetK[LOAD_K_LOOPS];
   uint offsetSlmK[LOAD_K_LOOPS];
@@ -583,7 +587,7 @@ void main() {
     fp32Out[cc] = fp32Out[cc] * softmaxMul;
   }
 
-  uint offsetCoord = outIdx * OUTPUT_PER_WORK_GROUP + vvo * TN + laneLoMatToScalar;
+  uint offsetCoord = outIdx * OUTPUT_LENGTH_PER_WG + vvoFold * TN + laneLoMatToScalar;
   [[unroll]] for (uint cc = 0; cc < OUTPUT_DIM_PER_WARP / SCALAR_MATRIX_REDUCE / 4; cc++) {
     const uint outDimCoord = 4 * cc + hho * OUTPUT_DIM_PER_WARP;
     if (offsetCoord < p.activationLength && outDimCoord < HEAD_DIM_PV) {

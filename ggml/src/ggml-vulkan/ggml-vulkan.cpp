@@ -3247,6 +3247,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             uint32_t slm_size = 64 * 1024;
             uint32_t acc_count = 1;
             uint32_t pipeline_flag = 0;
+            uint32_t gqa_folder = gqa_ratio % 16 == 0 ? 16 : gqa_ratio % 8 == 0 ? 8 : gqa_ratio % 4 == 0 ? 4 : gqa_ratio % 2 == 0 ? 2 : 1;
+            while (gqa_folder * output_div > 256 / xe_native_sub_group_size) {
+                gqa_folder = gqa_folder / 2;
+            }
 
             if (mask_dim % p_per_iter != 0) {
                 pipeline_flag |= 1 << 0x0;
@@ -3255,7 +3259,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             out_dim_per_warp = (out_dim_per_warp + output_div - 1) / output_div;
             out_dim_per_warp = out_dim_per_warp * matrix_shape_mnk[1];
             acc_count = matrix_shape_mnk[1] == 8 ? (out_dim_per_warp % 16 == 0 ? 2 : 1) : 1;
-            ggml_vk_create_pipeline(device, pipelines, "xe_fa_prefill", fa_prefill_cm1_len, fa_prefill_cm1_data, "main", 6, sizeof(vk_fa_xe_opt_push_constants), { 1, out_row_per_wg, 1 }, { group_sz, head_dim_qk, head_dim_pv, gqa_ratio, out_row_per_wg, p_per_iter, matrix_shape_mnk[0], q_in_reg, out_dim_per_warp, slm_size, acc_count, pipeline_flag, xe_native_sub_group_size, matrix_shape_mnk[1] }, 1, false, true, xe_native_sub_group_size);
+            ggml_vk_create_pipeline(device, pipelines, "xe_fa_prefill", fa_prefill_cm1_len, fa_prefill_cm1_data, "main", 6, sizeof(vk_fa_xe_opt_push_constants), { gqa_folder, out_row_per_wg / gqa_folder, 1 }, { group_sz, head_dim_qk, head_dim_pv, gqa_ratio, out_row_per_wg, p_per_iter, matrix_shape_mnk[0], q_in_reg, out_dim_per_warp, slm_size, acc_count, pipeline_flag, xe_native_sub_group_size, matrix_shape_mnk[1], gqa_folder }, 1, false, true, xe_native_sub_group_size);
         }
     }
 #endif
